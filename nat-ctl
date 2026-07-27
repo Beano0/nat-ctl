@@ -1,0 +1,167 @@
+#!/bin/bash
+# nat-ctl -- ufw-style manager for NAT/port-forward rules.
+#
+# Single source of truth: /etc/nat-ctl/rules.conf
+# --reload always flushes nat PREROUTING/POSTROUTING + FORWARD, then
+# rebuilds the entire ruleset from that file. Nothing is ever "patched"
+# in place, so there's no drift between what the file says and what's
+# actually live -- the two states can never disagree after a reload.
+#
+# Usage:
+#   nat-ctl --reload
+#   nat-ctl --list
+#   nat-ctl --delete <id>
+#   nat-ctl --fwd <dest_ip> --p <port> [--proto tcp|udp] --t "<tag>"
+#   nat-ctl --masq <subnet/cidr> --t "<tag>"
+#   nat-ctl --snat <subnet/cidr> --to <public_ip> --t "<tag>"
+#
+# Must run as root.
+
+set -euo pipefail
+
+RULES_FILE="/etc/nat-ctl/rules.conf"
+WAN_IF="vmbr0"
+
+mkdir -p "$(dirname "$RULES_FILE")"
+touch "$RULES_FILE"
+
+usage() {
+	cat <<EOF
+nat-ctl -- NAT / port-forward rule manager
+
+  --reload                          flush + reapply everything from $RULES_FILE
+  --list                            show all rules, numbered
+  --delete <id>                     remove rule by id, then reload
+  --fwd <dest_ip> --p <port> [--proto tcp|udp] --t "<tag>"
+                                     add a DNAT port forward from WAN
+  --masq <subnet> --t "<tag>"       add a MASQUERADE rule (dynamic public IP)
+  --snat <subnet> --to <ip> --t "<tag>"
+                                     add a static SNAT rule
+EOF
+}
+
+next_id() {
+	local max=0 id rest
+	while IFS='|' read -r id rest; do
+		[[ "$id" =~ ^[0-9]+$ ]] || continue
+		(( id > max )) && max=$id
+	done < "$RULES_FILE"
+	echo $((max + 1))
+}
+
+apply_rule_line() {
+	# format: id|type|k=v;k=v;k=v|comment
+	local line="$1" id type kv comment
+	IFS='|' read -r id type kv comment <<< "$line"
+
+	declare -A p
+	local kvpair k v
+	IFS=';' read -ra pairs <<< "$kv"
+	for kvpair in "${pairs[@]}"; do
+		k="${kvpair%%=*}"
+		v="${kvpair#*=}"
+		p[$k]="$v"
+	done
+
+	case "$type" in
+		fwd)
+			local proto="${p[proto]:-tcp}" port="${p[port]}" dest="${p[dest]}" dport="${p[dport]:-${p[port]}}"
+			iptables -t nat -A PREROUTING -i "$WAN_IF" -p "$proto" --dport "$port" \
+				-j DNAT --to-destination "${dest}:${dport}"
+			iptables -A FORWARD -p "$proto" -d "$dest" --dport "$dport" -j ACCEPT
+			;;
+		masq)
+			iptables -t nat -A POSTROUTING -s "${p[subnet]}" -o "$WAN_IF" -j MASQUERADE
+			;;
+		snat)
+			iptables -t nat -A POSTROUTING -s "${p[subnet]}" -o "$WAN_IF" \
+				-j SNAT --to-source "${p[to]}"
+			;;
+		*)
+			echo "  [!] rule #$id has unknown type '$type', skipped" >&2
+			;;
+	esac
+}
+
+reload_all() {
+	echo "[*] Flushing nat PREROUTING/POSTROUTING + FORWARD"
+	iptables -t nat -F PREROUTING
+	iptables -t nat -F POSTROUTING
+	iptables -F FORWARD
+
+	local count
+	count=$(grep -c . "$RULES_FILE" 2>/dev/null || echo 0)
+	echo "[*] Reapplying $count rule(s) from $RULES_FILE"
+
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		apply_rule_line "$line"
+	done < "$RULES_FILE"
+
+	echo "[*] Reload complete"
+}
+
+list_rules() {
+	printf "%-4s %-6s %-45s %s\n" "ID" "TYPE" "DETAILS" "TAG"
+	printf "%-4s %-6s %-45s %s\n" "--" "----" "-------" "---"
+	local id type kv comment
+	while IFS='|' read -r id type kv comment; do
+		[[ -z "$id" ]] && continue
+		printf "%-4s %-6s %-45s %s\n" "$id" "$type" "$kv" "$comment"
+	done < "$RULES_FILE"
+}
+
+delete_rule() {
+	local id="$1"
+	if ! grep -q "^${id}|" "$RULES_FILE"; then
+		echo "[!] no rule #$id found" >&2
+		exit 1
+	fi
+	grep -v "^${id}|" "$RULES_FILE" > "${RULES_FILE}.tmp" || true
+	mv "${RULES_FILE}.tmp" "$RULES_FILE"
+	echo "[*] Rule #$id removed, reloading to apply"
+	reload_all
+}
+
+add_rule() {
+	local type="$1" kv="$2" comment="$3" id
+	id=$(next_id)
+	echo "${id}|${type}|${kv}|${comment}" >> "$RULES_FILE"
+	echo "[*] Added rule #$id ($type: $kv)"
+	apply_rule_line "$(grep "^${id}|" "$RULES_FILE")"
+}
+
+# --- arg parsing ---
+ACTION="" DEST="" PORT="" PROTO="tcp" TAG="" SUBNET="" TO="" DEL_ID=""
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--reload) ACTION="reload"; shift ;;
+		--list) ACTION="list"; shift ;;
+		--delete) ACTION="delete"; DEL_ID="${2:-}"; shift 2 ;;
+		--fwd) ACTION="fwd"; DEST="${2%%/*}"; shift 2 ;;
+		--masq) ACTION="masq"; SUBNET="${2:-}"; shift 2 ;;
+		--snat) ACTION="snat"; SUBNET="${2:-}"; shift 2 ;;
+		--to) TO="${2:-}"; shift 2 ;;
+		--p|--port) PORT="${2:-}"; shift 2 ;;
+		--proto) PROTO="${2:-}"; shift 2 ;;
+		--t|--tag) TAG="${2:-}"; shift 2 ;;
+		-h|--help) usage; exit 0 ;;
+		*) echo "unknown arg: $1" >&2; usage; exit 1 ;;
+	esac
+done
+
+if [[ "$EUID" -ne 0 ]]; then
+	echo "[!] must run as root" >&2
+	exit 1
+fi
+
+case "$ACTION" in
+	reload) reload_all ;;
+	list) list_rules ;;
+	delete) delete_rule "$DEL_ID" ;;
+	fwd) add_rule "fwd" "proto=${PROTO};port=${PORT};dest=${DEST};dport=${PORT}" "$TAG" ;;
+	masq) add_rule "masq" "subnet=${SUBNET}" "$TAG" ;;
+	snat) add_rule "snat" "subnet=${SUBNET};to=${TO}" "$TAG" ;;
+	*) usage; exit 1 ;;
+esac
